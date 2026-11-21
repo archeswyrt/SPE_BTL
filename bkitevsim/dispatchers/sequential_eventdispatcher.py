@@ -128,8 +128,7 @@ class SequentialEventDispatcher:
             # Deliver event to receiver LP
             receiver = self.lps.get(event.receiver_id)
             if receiver is None:
-                logger.warning(f"No LP found for receiver_id={event.receiver_id}, dropping event")
-                continue
+                raise ValueError(f"Target LP {event.receiver_id} does not exist for event {event.event_type}")
             
             # Update receiver's LVT
             receiver.set_local_virt_time(event.timestamp)
@@ -288,7 +287,7 @@ class DistributedEventDispatcher(SequentialEventDispatcher):
             
             receiver = self.lps.get(event.receiver_id)
             if receiver is None:
-                continue
+                raise ValueError(f"Target LP {event.receiver_id} does not exist for event {event.event_type}")
             
             # Synchronize LP's local virtual time to global time (event timestamp)
             old_lvt = receiver.local_virt_time
