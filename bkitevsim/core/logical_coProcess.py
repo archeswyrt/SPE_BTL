@@ -43,6 +43,7 @@ ALL_COMPLETED = asyncio.ALL_COMPLETED
 # Error types (re-exported from asyncio)
 CANCELLED_ERROR = asyncio.CancelledError
 TIMEOUT_ERROR = asyncio.TimeoutError
+EVENT_TIMEOUT_ERROR = asyncio.TimeoutError
 
 
 class BkSysCoLPStatus(Enum):
@@ -109,7 +110,9 @@ class BkSysCoEventLoop:
             "events_processed": 0,
             "coroutines_scheduled": 0,
             "context_switches": 0,
-            "wall_time": 0.0
+            "wall_time": 0.0,
+            "status": "COMPLETED",
+            "failure_reason": None,
         }
         
         # Callbacks
@@ -126,7 +129,7 @@ class BkSysCoEventLoop:
         return self._current_time
     
     def register_lp(self, lp: BkSysLogicalProcess) -> None:
-        """Register a LogicalProcess coroutine.
+        """Register a LogicalProcess.
         
         Args:
             lp: The LogicalProcess to register.
@@ -134,17 +137,22 @@ class BkSysCoEventLoop:
         Raises:
             ValueError: If registered LP is duplicate.
         """
-        if lp.lp_id in self._lp_coroutines:
+        if lp.lp_id in self._lp_instances:
             raise ValueError(f"LP {lp.lp_id} already registered")
         
         # Store the LP instance for handle_event delivery
         self._lp_instances[lp.lp_id] = lp
+        lp.send_event = self.schedule_event
+        if hasattr(lp, 'set_event_loop'):
+            lp.set_event_loop(self)
         
-        # Store the coroutine factory (not the task yet - no running loop)
-        self._lp_coroutines[lp.lp_id] = lp.coroutine_run
+        # Store the coroutine factory if available
+        coro_func = getattr(lp, 'coroutine_run', None)
+        if callable(coro_func):
+            self._lp_coroutines[lp.lp_id] = coro_func
         self._lp_status[lp.lp_id] = BkSysCoLPStatus.READY
         
-        logger.debug(f"Registered coroutine LP {lp.lp_id}")
+        logger.debug(f"Registered LP {lp.lp_id}")
     
     def _create_lp_tasks(self) -> None:
         """Create tasks for all registered LPs (call when loop is running).
@@ -186,37 +194,30 @@ class BkSysCoEventLoop:
     
     async def wait_for_event(self, lp_id: int, event_type: str, timeout: float = None) -> Event:
         """Coroutine wait for a specific event type.
-        Elaspse time control until an event of the given type arrives.
+        Elapse time control until an event of the given type arrives.
         
         Args:
             lp_id: ID of the LP waiting for the event.
             event_type: Type of event to wait for.
-            timeout: Optional timeout in seconds.
+            timeout: Optional timeout (wall-clock timeout is disabled).
             
         Returns:
             The received event.
             
         Raises:
-            TIMEOUT_ERROR: If timeout expires before event arrives.
+            NotImplementedError: If wall-clock timeout is specified.
         """
+        if timeout is not None:
+            raise NotImplementedError("Wall-clock timeout is disabled; schedule an OP_TIMEOUT event in simulation time instead.")
+
         future = self.create_future()
         self._event_waiters[event_type].append((lp_id, future))
         self._lp_status[lp_id] = BkSysCoLPStatus.WAITING_EVENT
         self._lp_waiting_for[lp_id] = event_type
         
-        try:
-            if timeout:
-                event = await asyncio.wait_for(future, timeout=timeout)
-            else:
-                event = await future
-            self._lp_status[lp_id] = BkSysCoLPStatus.READY
-            return event
-        except TIMEOUT_ERROR:
-            self._lp_status[lp_id] = BkSysCoLPStatus.READY
-            # Remove from waiters
-            waiters = self._event_waiters[event_type]
-            self._event_waiters[event_type] = [(lid, f) for lid, f in waiters if lid != lp_id]
-            raise EVENT_TIMEOUT_ERROR(f"Timeout waiting for event type '{event_type}'")
+        event = await future
+        self._lp_status[lp_id] = BkSysCoLPStatus.READY
+        return event
     
     async def wait_until_time(self, lp_id: int, target_time: float) -> float:
         """Coroutine wait until virtual time reaches target_time.
@@ -256,32 +257,48 @@ class BkSysCoEventLoop:
         target = self._current_time + delta
         return await self.wait_until_time(lp_id, target)
     
-    def _advance_time_to_next_event(self) -> bool:
-        """Advance simulation time to the next event or time waiter.
+    def _deliver_event(self, event: Event) -> None:
+        """Deliver an event to the target logical process. Fail-fast if LP missing or error occurs."""
+        if self._on_event:
+            self._on_event(event)
         
-        Returns:
-            True if time advanced, False otherwise.
-        """
-        # Get next event time peek priority from event queue
-        next_event_time = self._event_queue.peek_priority()
+        lp_instance = self._lp_instances.get(event.receiver_id)
+        if lp_instance is None:
+            raise ValueError(f"Target LP {event.receiver_id} does not exist for event {event.event_type}")
         
-        # Fallback: if peek_priority returns None
-        #           but queue has items, scan buckets directly
-        if next_event_time is None and (self._event_queue.size() > 0 
-           or hasattr(self._event_queue._queue, '_buckets')):
-            # Scan all buckets to find minimum timestamp
-            min_ts = None
-            for bucket in self._event_queue._queue._buckets.values():
-                if bucket:
-                    ts = bucket[0][0]
-                    if min_ts is None or ts < min_ts:
-                        min_ts = ts
-            if min_ts is not None and min_ts <= self.end_time:
-                next_event_time = min_ts
+        if hasattr(lp_instance, 'handle_event'):
+            old_lvt = lp_instance.local_virt_time
+            lp_instance.set_local_virt_time(event.timestamp)
+            logger.debug(f"SYNC: LP {event.receiver_id} LVT {old_lvt:.3f} -> {event.timestamp:.3f} (GVT={self._current_time:.3f})")
+            # Fail-fast: do not catch and swallow exceptions raised in handle_event
+            lp_instance.handle_event(event)
+        
+        # After delivering, notify any registered event waiters
+        waiters = self._event_waiters.get(event.event_type, [])
+        for lp_id, future in waiters:
+            if lp_id == event.receiver_id and not future.done():
+                future.set_result(event)
+                self._lp_status[lp_id] = BkSysCoLPStatus.READY
+        
+        self._event_waiters[event.event_type] = [
+            (lid, f) for lid, f in waiters
+            if lid != event.receiver_id or not f.done()
+        ]
 
-        # Verify next_event_time existance and is within end_time
-        if next_event_time is None and hasattr(self._event_queue, '_heap') and self._event_queue._heap:
-            next_event_time = self._event_queue._heap[0][0]
+    def _check_task_exceptions(self) -> None:
+        """Check all LP tasks and raise immediately if any failed with an unhandled exception."""
+        for lp_id, task in list(self._lp_coroutines.items()):
+            if isinstance(task, asyncio.Task) and task.done():
+                if self._lp_status.get(lp_id) != BkSysCoLPStatus.TERMINATED:
+                    self._lp_status[lp_id] = BkSysCoLPStatus.TERMINATED
+                if not task.cancelled():
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+
+    def _advance_time_to_next_event(self) -> bool:
+        """Advance simulation time to the next scheduled event or time waiter."""
+        next_event_time = self._event_queue.peek_priority()
         
         next_waiter_time = None
         if not self._time_waiters.is_empty():
@@ -289,7 +306,6 @@ class BkSysCoEventLoop:
             if next_waiter:
                 next_waiter_time = next_waiter[0]
         
-        # Get next_time as the minimum valid time
         next_time = None
         if next_event_time is not None and next_event_time <= self.end_time:
             next_time = next_event_time
@@ -300,30 +316,25 @@ class BkSysCoEventLoop:
         if next_time is None:
             return False
         
-        # Resolve time waiters
+        self._current_time = next_time
+        
+        # Resolve all time waiters up to current_time
         while not self._time_waiters.is_empty():
             waiter = self._time_waiters.peek()
             if waiter is None:
                 break
             wait_time = waiter[0]
-            if wait_time > next_time:
+            if wait_time > self._current_time:
                 break
             _, lp_id, future = self._time_waiters.pop()
-            self._current_time = wait_time
             if not future.done():
-                future.set_result(wait_time)
+                future.set_result(self._current_time)
                 self._lp_status[lp_id] = BkSysCoLPStatus.READY
         
-        self._current_time = next_time
         return True
-    
+
     def _process_events_at_current_time(self) -> int:
-        """Process all events at current time.
-        
-        Returns:
-            Number of events processed.
-        """
-        # check existed events at current time (non-empty event queue)            
+        """Process all events at current time."""
         count = 0
         while not self._event_queue.is_empty():
             next_priority = self._event_queue.peek_priority()
@@ -332,65 +343,17 @@ class BkSysCoEventLoop:
             event = self._event_queue.pop()
             if event is None:
                 break
-            if self._on_event:
-                self._on_event(event)
-            
-            # Deliver event to targeted Logical Process holding handle_event
-            lp_instance = self._lp_instances.get(event.receiver_id)
-            if lp_instance and hasattr(lp_instance, 'handle_event'):
-                try:
-                    # Sync LP's local virtual time to event timestamp (like SequentialEventDispatcher does)
-                    old_lvt = lp_instance.local_virt_time
-                    lp_instance.set_local_virt_time(event.timestamp)
-                    
-                    # Log synchronization for visualization
-                    logger.debug(f"SYNC: LP {event.receiver_id} LVT {old_lvt:.3f} -> {event.timestamp:.3f} (GVT={self._current_time:.3f})")
-                    
-                    lp_instance.handle_event(event)
-                except Exception as e:
-                    logger.error(f"Error in handle_event for LP {event.receiver_id}: {e}")
-            
-            # After delivering, check if any LPs are waiting for this event type
-            waiters = self._event_waiters.get(event.event_type, [])
-            for lp_id, future in waiters:
-                if lp_id == event.receiver_id and not future.done():
-                    future.set_result(event)
-                    self._lp_status[lp_id] = BkSysCoLPStatus.READY
-            
-            # Remove fulfilled waiters
-            self._event_waiters[event.event_type] = [
-                (lid, f) for lid, f in waiters
-                if lid != event.receiver_id or not f.done()
-            ]
-            
+            self._deliver_event(event)
             count += 1
             self.stats["events_processed"] += 1
-        
         return count
-    
+
     def run(self, max_iterations: int = None) -> tp.Dict:
-        """Run the coroutine event loop.
-        
-        Args:
-            max_iterations: Optional maximum number of iterations.
-            
-        Returns:
-            Dictionary with simulation statistics.
-        """
+        """Run the coroutine event loop."""
         return asyncio.run(self._run_async(max_iterations))
-    
+
     async def _run_async(self, max_iterations: int = None) -> tp.Dict:
-        """Async implementation of the event loop.
-        
-        Args:
-            max_iterations: Optional maximum number of iterations.
-            
-        Returns:
-            Dictionary with simulation statistics.
-        """
-        # Create tasks for all registered LPs
-        self._create_lp_tasks()
-        
+        """Async implementation of the event loop."""
         self._running = True
         start_wall = time.perf_counter()
         iteration = 0
@@ -398,86 +361,98 @@ class BkSysCoEventLoop:
         logger.info(f"Starting coroutine event loop (end_time={self.end_time})")
         
         try:
-            # Let coroutines run once to initialize events
+            self._create_lp_tasks()
+            # Let coroutines run once to initialize and schedule initial events
             await asyncio.sleep(0)
+            async_loop = asyncio.get_running_loop()
+            while hasattr(async_loop, '_ready') and len(async_loop._ready) > 0:
+                await asyncio.sleep(0)
+            self._check_task_exceptions()
             
             while self._running:
                 if max_iterations and iteration >= max_iterations:
                     logger.info(f"Reached max iterations ({max_iterations})")
                     break
                 
-                # Check for tasks and status
-                for lp_id, task in list(self._lp_coroutines.items()):
-                    if isinstance(task, asyncio.Task) and task.done():
-                        if self._lp_status.get(lp_id) != BkSysCoLPStatus.TERMINATED:
-                            logger.debug(f"LP {lp_id} task completed")
-                            self._lp_status[lp_id] = BkSysCoLPStatus.TERMINATED
-                            try:
-                                task.result()
-                            except Exception as e:
-                                logger.error(f"LP {lp_id} task failed: {e}")
+                # Check for LP tasks that finished
+                self._check_task_exceptions()
                 
-                # Process all events at current time
-                processed = self._process_events_at_current_time()
-                if processed > 0:
-                    logger.debug(f"Processed {processed} events at time {self._current_time}")
-                
-                # After processing events, elapse new events to progress time
-                if processed > 0:
-                    # Elapse a few iterations to allow coroutines to run
-                    for _ in range(3):
+                # Quiescence loop at current simulation timestamp:
+                # Repeatedly process events and allow all coroutine continuations to complete
+                # until no new events or runnable coroutines exist at current_time.
+                while True:
+                    # 1. Process all events at current timestamp
+                    self._process_events_at_current_time()
+                    self._check_task_exceptions()
+                    
+                    # 2. Drain all runnable coroutine continuations at current timestamp
+                    await asyncio.sleep(0)
+                    while hasattr(async_loop, '_ready') and len(async_loop._ready) > 0:
                         await asyncio.sleep(0)
-                    continue
+                    self._check_task_exceptions()
+                    
+                    # 3. Check if any newly generated event was scheduled at current timestamp
+                    next_p = self._event_queue.peek_priority()
+                    if next_p is not None and next_p <= self._current_time:
+                        continue
+                    
+                    # 4. Check if any coroutine became ready again
+                    if hasattr(async_loop, '_ready') and len(async_loop._ready) > 0:
+                        continue
+                    
+                    # Both event queue and coroutines are quiescent at current_time
+                    break
                 
-                # Check  ready coroutines
-                ready_lps = [
-                    lp_id for lp_id, status in self._lp_status.items()
-                    if status == BkSysCoLPStatus.READY
-                ]
-                if ready_lps:
-                    # After processing coroutines, elapse new events to progress time
-                    for _ in range(3):
-                        await asyncio.sleep(0)
-                    continue
-                
-                # No events and no ready coroutines, process time advancement
+                # Advance simulation time to the next earliest event or timer
                 time_advanced = self._advance_time_to_next_event()
                 if not time_advanced:
                     alive_lps = [lp_id for lp_id, status in self._lp_status.items()
-                             if status != BkSysCoLPStatus.TERMINATED]
-                    if alive_lps:
+                                 if status != BkSysCoLPStatus.TERMINATED]
+                    if not alive_lps:
                         logger.info("All LPs terminated - simulation complete")
                     else:
-                        logger.warning(
-                            "No events or timers left before end_time; "
-                            f"stranded LPs: "
-                            f"{ {lp_id: self._lp_waiting_for.get(lp_id) for lp_id in alive_lps} }")
+                        logger.info(f"No events or timers left before end_time={self.end_time}; ending simulation at t={self._current_time}")
                     break
-
-                # After processing time advancement, elapse new events to progress time
-                for _ in range(3):
-                    await asyncio.sleep(0)
+                
                 logger.debug(f"Advanced time to {self._current_time}")
-
-                # Update next iteration                
                 iteration += 1
 
+            self.stats["status"] = "COMPLETED"
+            self.stats["failure_reason"] = None
+
         except Exception as e:
-            logger.error(f"Event loop error: {e}")
-            raise
+            self.stats["status"] = "FAILED"
+            self.stats["failure_reason"] = f"{type(e).__name__}: {e}"
+            logger.error(f"Event loop failure (transitioning to FAILED): {e}")
         finally:
             self._running = False
+            # Clean up pending tasks
             pending = [t for t in self._lp_coroutines.values()
                        if isinstance(t, asyncio.Task) and not t.done()]
             for t in pending:
                 t.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+            
+            # Clean up time waiters
+            while not self._time_waiters.is_empty():
+                item = self._time_waiters.pop()
+                if item and len(item) >= 3:
+                    fut = item[2]
+                    if hasattr(fut, 'done') and not fut.done():
+                        fut.cancel()
+            
+            # Clean up event waiters
+            for et, waiters in list(self._event_waiters.items()):
+                for lp_id, fut in waiters:
+                    if hasattr(fut, 'done') and not fut.done():
+                        fut.cancel()
+            self._event_waiters.clear()
+            
             self.stats["wall_time"] = time.perf_counter() - start_wall
-            logger.info(f"Coroutine event loop finished. "
-                       f"Events: {self.stats['events_processed']}, "
-                       f"Switches: {self.stats['context_switches']}, "
-                       f"Wall time: {self.stats['wall_time']:.4f}s")
+            logger.info(f"Coroutine event loop finished. Status: {self.stats['status']}, "
+                        f"Events: {self.stats['events_processed']}, "
+                        f"Wall time: {self.stats['wall_time']:.4f}s")
         
         return self.get_stats()
     
@@ -663,11 +638,13 @@ class BkSysCoLogicalProcess(BkSysLogicalProcess):
             The first received event.
             
         Raises:
-            TIMEOUT_ERROR: If timeout expires before any event arrives.
+            NotImplementedError: If wall-clock timeout is specified.
             RuntimeError: If event loop is not set.
         """
         if not self._event_loop:
             raise RuntimeError("Event loop not set")
+        if timeout is not None:
+            raise NotImplementedError("Wall-clock timeout is disabled; schedule an OP_TIMEOUT event in simulation time instead.")
         
         # Check pending event
         for i, pending_event in enumerate(self._pending_events):
@@ -688,10 +665,7 @@ class BkSysCoLogicalProcess(BkSysLogicalProcess):
         try:
             # Extract future objects
             future_objects = [f for _, f in futures]
-            if timeout:
-                done, pending = await asyncio.wait(future_objects, timeout=timeout, return_when=FIRST_COMPLETED)
-            else:
-                done, pending = await asyncio.wait(future_objects, return_when=FIRST_COMPLETED)
+            done, pending = await asyncio.wait(future_objects, return_when=FIRST_COMPLETED)
             
             # Cancel pending futures
             for et, future in futures:
@@ -734,9 +708,9 @@ class BkSysCoLogicalProcess(BkSysLogicalProcess):
         """Initialize is handled by coroutine_run."""
         pass
     
-    def coroutine_run(self) -> tp.Awaitable[None]:
-        """Main coroutine - must be implemented by subclasses."""
-        raise NotImplementedError
+    async def coroutine_run(self) -> None:
+        """Main coroutine - optional or implemented by subclasses."""
+        pass
 
 
 # Export commonly used types
