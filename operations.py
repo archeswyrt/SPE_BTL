@@ -4,13 +4,13 @@
 Operation manager for non-blocking inter-LP communication.
 
 An *operation* is one asynchronous "send a request to another LP and wait for the
-admission ACK" interaction. It is NOT a business request:
+admission ACK" interaction:
 
     * Request  : end-to-end business entity (request_id is kept for its whole life).
     * Visit    : one arrival of a request at a station (fresh visit_id each time).
     * Operation: one control exchange (ARRIVAL -> ADMISSION_ACK), fresh operation_id.
 
-Design rules implemented here (see Phase 1 report, section 1.4):
+Design rules implemented:
 
     * An operation finishes exactly once, in one of: SUCCEEDED, TIMED_OUT,
       CANCELLED, FAILED. The Future bound to it is resolved exactly once.

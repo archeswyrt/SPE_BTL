@@ -79,8 +79,6 @@ Two execution modes (same business behaviour, see test N14):
         * BkSysCoEventLoop only inspects LP tasks for exceptions, so the router's own
           ``coroutine_run`` is a supervisor task that re-raises the first failure of any
           request coroutine; the loop then ends the replication with status FAILED.
-        * ``track_acks`` is kept for backward compatibility and has no extra effect:
-          the request coroutines already await every ACK (counted in ``ack_watch``).
         Admission ACK delay is 0, so business results match Case 1 exactly.
 
 Usage:
@@ -339,8 +337,6 @@ class RouterLP(BkSysCoLogicalProcess):
         metrics: optional collector (see module docstring).
         force_route: test hook ``f(request, cpu_visit_index) -> bool`` (True = go to
             Disk) that replaces the random routing decision.
-        track_acks: kept for backward compatibility; in Case 2 every request coroutine
-            already awaits all of its ACK Futures, so this flag changes nothing.
         record_history: keep every Request, Visit and a flow trace (tests / diagnostics).
         use_operations: False = Case 1 "pure" network (no operation_id, no ACK, no Future,
             no coroutine); True (default) = Case 2, one coroutine per request awaiting
@@ -356,13 +352,10 @@ class RouterLP(BkSysCoLogicalProcess):
         routing_delay_s: float = 0.0,
         metrics: Any = None,
         force_route: Optional[Callable[[Request, int], bool]] = None,
-        track_acks: bool = False,
         record_history: bool = False,
         use_operations: bool = True,
     ):
         super().__init__(lp_id)
-        if track_acks and not use_operations:
-            raise ValueError("track_acks requires use_operations=True")
         if not (0.0 <= p < 1.0):
             raise ValueError(f"routing probability p must satisfy 0 <= p < 1, got {p}")
         if not math.isfinite(routing_delay_s) or routing_delay_s < 0:
@@ -372,7 +365,6 @@ class RouterLP(BkSysCoLogicalProcess):
         self.routing_rng = routing_rng
         self.routing_delay_s = float(routing_delay_s)
         self._force_route = force_route
-        self._track_acks = track_acks
         self._use_ops = use_operations
         self.ops: Optional[OperationManager] = None
 
@@ -780,7 +772,6 @@ def build_network(
     metrics: Any = None,
     operation_deadline_s: Optional[float] = None,
     routing_delay_s: float = 0.0,
-    track_acks: bool = False,
     use_operations: bool = True,
     record_history: bool = False,
     retain_operation_records: bool = False,
@@ -802,8 +793,6 @@ def build_network(
         operation_deadline_s: None (baseline: no OP_TIMEOUT events) or a finite
             positive ACK deadline in simulation seconds (timeout test cases only).
         routing_delay_s: transfer delay, 0 in the baseline configuration.
-        track_acks: kept for backward compatibility (no extra effect: in Case 2 every
-            request coroutine already awaits its ACKs).
         use_operations: False builds the Case 1 pure network (no operations/ACK/Future).
         record_history / retain_operation_records / trace_operations: diagnostics.
         force_route / service_time_generators: deterministic hooks for unit tests
@@ -821,8 +810,6 @@ def build_network(
         NODE_CPU: StationConfig.from_any(cpu),
         NODE_DISK: StationConfig.from_any(disk),
     }
-    if track_acks and not use_operations:
-        raise ValueError("track_acks requires use_operations=True")
     if cfg[NODE_INGRESS].c != 1:
         raise ValueError("Ingress must have exactly one server (c == 1)")
 
@@ -837,7 +824,7 @@ def build_network(
     router = RouterLP(
         LP_ROUTER, DEFAULT_NODE_LP_IDS, p, streams.routing,
         routing_delay_s=routing_delay_s, metrics=metrics, force_route=force_route,
-        track_acks=track_acks, record_history=record_history, use_operations=use_operations,
+        record_history=record_history, use_operations=use_operations,
     )
     ops = OperationManager(
         owner_lp_id=LP_ROUTER,
