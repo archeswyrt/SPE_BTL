@@ -1,6 +1,6 @@
 # Copyright (C) 2026 SPE Team - Dev 2
 """
-Test N03: rejection on the Disk -> CPU feedback branch (CPU full), Case 2 (coroutine + Future).
+Test N03: rejection on the Disk -> CPU feedback branch (CPU full), coroutine + Future.
 
 Rule under test (Phase 1, section 1.5): a request that reaches a full station is DROPPED at
 admission, leaves the whole network and is never retried. This applies to feedback arrivals
@@ -77,9 +77,7 @@ class TestN03FeedbackDropCpuFull(unittest.TestCase):
                 "Disk": lambda: 3.0,
             },
             force_route=lambda req, cpu_visit_index: req.request_id == "R1" and cpu_visit_index == 1,
-            use_operations=True,                 # Case 2: coroutine + Future
             record_history=True,
-            retain_operation_records=True,
         )
         result = net.run()
         collector.close_window()

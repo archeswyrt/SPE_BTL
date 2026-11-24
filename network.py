@@ -53,33 +53,27 @@ Optional methods, called only if the object defines them (to be agreed with Dev 
     on_visit_rejected(request, visit, node, t)
 close_window(t1) and finalize(t_end) are NOT called here; run.py owns them.
 
-Two execution modes (same business behaviour, see test N14):
+How a request travels (coroutine + Future):
 
-    Case 1 "pure"  (use_operations=False): plain event-driven network. ARRIVAL events carry
-                    no operation_id, so stations send no ACK; no Future, no coroutine.
-                    Routing is done directly inside the on_departure callback.
-    Case 2 "async" (use_operations=True, default): the design drawn as "case 2".
-        * Each external arrival starts one coroutine ``_request_flow(request)`` that owns
-          the route of the request as a ``while`` loop (Ingress -> CPU -> (Disk -> CPU)*
-          -> Sink).
-        * Every transfer is an *operation* (ARRIVAL -> ADMISSION_ACK) tracked by the
-          OperationManager; the coroutine awaits its ACK Future (accepted and rejected
-          are both successful communication).
-        * For every station visit the router creates Future[(request_id, visit_id)]. The
-          sending station has already released its server (QueueNodeLP frees it before
-          on_departure), the coroutine just sleeps on the Future. When that visit
-          finishes service, on_departure calls ``set_result`` ("Disk set_result()") and
-          the coroutine wakes up at the same simulation timestamp and loops on to the
-          next station (Disk -> CPU feedback included). Awaiting suspends only the
-          coroutine; the dispatcher keeps processing every other event.
-        * Admission is decided by the station at the arrival timestamp: a rejected
-          arrival finalises the request as DROPPED (on_rejected) and ends its coroutine.
-          This never depends on a Future, so a timeout/cancel of the *waiting* cannot
-          change a business outcome.
-        * BkSysCoEventLoop only inspects LP tasks for exceptions, so the router's own
-          ``coroutine_run`` is a supervisor task that re-raises the first failure of any
-          request coroutine; the loop then ends the replication with status FAILED.
-        Admission ACK delay is 0, so business results match Case 1 exactly.
+    * Each external arrival starts one coroutine ``_request_flow(request)`` that owns the
+      route of the request as a ``while`` loop (Ingress -> CPU -> (Disk -> CPU)* -> Sink).
+    * Every transfer is an *operation* (ARRIVAL -> ADMISSION_ACK) tracked by the
+      OperationManager; the coroutine awaits its ACK Future (accepted and rejected are
+      both successful communication).
+    * For every station visit the router creates Future[(request_id, visit_id)]. The
+      sending station has already released its server (QueueNodeLP frees it before
+      on_departure), so the coroutine just sleeps on the Future. When that visit finishes
+      service, on_departure calls ``set_result`` and the coroutine wakes up at the same
+      simulation timestamp and loops on to the next station (Disk -> CPU feedback
+      included). Awaiting suspends only the coroutine; the dispatcher keeps processing
+      every other event.
+    * Admission is decided by the station at the arrival timestamp: a rejected arrival
+      finalises the request as DROPPED (on_rejected) and ends its coroutine. This never
+      depends on a Future, so a timeout/cancel of the *waiting* cannot change a business
+      outcome.
+    * BkSysCoEventLoop only inspects LP tasks for exceptions, so the router's own
+      ``coroutine_run`` is a supervisor task that re-raises the first failure of any
+      request coroutine; the loop then ends the replication with status FAILED.
 
 Usage:
     net = build_network(alpha=40, p=0.3, ingress=..., cpu=..., disk=..., end_time=1200,
@@ -109,7 +103,6 @@ from contracts import (
 )
 from operations import (
     OperationCancelledError,
-    OperationFailedError,
     OperationManager,
     OperationRecord,
     OperationTimeoutError,
@@ -217,7 +210,7 @@ class SourceLP(BkSysCoLogicalProcess):
         alpha: float,
         arrival_rng: Any,
         on_external_arrival: Callable[[Request, float], None],
-        end_time: Optional[float] = None,
+        end_time: float,
     ):
         super().__init__(lp_id)
         if not math.isfinite(alpha) or alpha < 0:
@@ -236,7 +229,7 @@ class SourceLP(BkSysCoLogicalProcess):
         if self.alpha <= 0:
             return
         t_next = now + self.arrival_rng.expovariate(self.alpha)
-        if self.end_time is not None and t_next > self.end_time:
+        if t_next > self.end_time:
             return  # would never be processed; do not leave dead events in the queue
         self.send_event(Event(
             timestamp=t_next,
@@ -275,9 +268,6 @@ class SinkLP(BkSysCoLogicalProcess):
         self._on_completed = on_completed
         self.completed = 0
         self.terminal_conflicts = 0  # request already had an outcome (must stay 0)
-
-    async def coroutine_run(self) -> None:
-        pass
 
     def handle_event(self, event: Event) -> None:
         if event.event_type != EVENT_ARRIVAL:
@@ -338,9 +328,6 @@ class RouterLP(BkSysCoLogicalProcess):
         force_route: test hook ``f(request, cpu_visit_index) -> bool`` (True = go to
             Disk) that replaces the random routing decision.
         record_history: keep every Request, Visit and a flow trace (tests / diagnostics).
-        use_operations: False = Case 1 "pure" network (no operation_id, no ACK, no Future,
-            no coroutine); True (default) = Case 2, one coroutine per request awaiting
-            Future[(request_id, visit_id)] (see module docstring).
     """
 
     def __init__(
@@ -353,7 +340,6 @@ class RouterLP(BkSysCoLogicalProcess):
         metrics: Any = None,
         force_route: Optional[Callable[[Request, int], bool]] = None,
         record_history: bool = False,
-        use_operations: bool = True,
     ):
         super().__init__(lp_id)
         if not (0.0 <= p < 1.0):
@@ -365,7 +351,6 @@ class RouterLP(BkSysCoLogicalProcess):
         self.routing_rng = routing_rng
         self.routing_delay_s = float(routing_delay_s)
         self._force_route = force_route
-        self._use_ops = use_operations
         self.ops: Optional[OperationManager] = None
 
         # Metrics hooks (resolved once; None = not provided)
@@ -383,10 +368,7 @@ class RouterLP(BkSysCoLogicalProcess):
         self.n_dropped = 0
         self.drops_by_node: dict[str, int] = {n: 0 for n in STATION_NAMES}
         self.visits_by_node: dict[str, int] = {n: 0 for n in STATION_NAMES}
-        # Ack outcomes observed by the request coroutines (Case 2)
-        self.ack_watch = {"accepted": 0, "rejected": 0, "timed_out": 0, "cancelled": 0, "failed": 0}
-
-        # Case 2 state: one coroutine per request, Future[(request_id, visit_id)] per visit
+        # One coroutine per request, Future[(request_id, visit_id)] per station visit
         self._completions: dict[tuple[str, str], asyncio.Future] = {}
         self._flows: set[asyncio.Task] = set()   # strong refs: asyncio keeps only weak ones
         self._supervisor: Optional[asyncio.Future] = None
@@ -405,14 +387,12 @@ class RouterLP(BkSysCoLogicalProcess):
 
     async def coroutine_run(self) -> None:
         """
-        Supervisor of the request coroutines (Case 2 only).
+        Supervisor of the request coroutines.
 
         BkSysCoEventLoop only inspects LP tasks for exceptions, so request coroutines
         report their failure here: this task re-raises the first one and the loop then
         stops the replication with status FAILED. The loop cancels it at the end.
         """
-        if not self._use_ops:
-            return
         self._supervisor = self._event_loop.create_future()
         if self._flow_failure is not None:
             self._supervisor.set_exception(self._flow_failure)
@@ -423,9 +403,6 @@ class RouterLP(BkSysCoLogicalProcess):
     def n_unfinished(self) -> int:
         """Requests that have no outcome yet (final value is read at t_end)."""
         return len(self._open)
-
-    def unfinished_requests(self) -> list[Request]:
-        return list(self._open.values())
 
     def _now(self) -> float:
         return self._event_loop.current_time
@@ -456,13 +433,10 @@ class RouterLP(BkSysCoLogicalProcess):
             self.history_requests[request.request_id] = request
         if self._m_external:
             self._m_external(request, t)
-        if self._use_ops:
-            task = asyncio.get_running_loop().create_task(self._flow_guard(request))
-            self._flows.add(task)
-            task.add_done_callback(self._flows.discard)
-            self.flows_started += 1
-        else:
-            self._dispatch(request, NODE_INGRESS, t)
+        task = asyncio.get_running_loop().create_task(self._flow_guard(request))
+        self._flows.add(task)
+        task.add_done_callback(self._flows.discard)
+        self.flows_started += 1
 
     # ----------------------------------------------------- request coroutine
     async def _flow_guard(self, request: Request) -> None:
@@ -484,18 +458,9 @@ class RouterLP(BkSysCoLogicalProcess):
     async def _await_ack(self, rec: OperationRecord) -> Optional[bool]:
         """Await the admission ACK Future. None = the waiting ended without an answer."""
         try:
-            accepted = await self.ops.wait_ack(rec)
-        except OperationTimeoutError:
-            self.ack_watch["timed_out"] += 1
+            return await self.ops.wait_ack(rec)
+        except (OperationTimeoutError, OperationCancelledError):
             return None  # only the waiting ended; the station still decides on its own
-        except OperationCancelledError:
-            self.ack_watch["cancelled"] += 1
-            return None
-        except OperationFailedError:
-            self.ack_watch["failed"] += 1
-            raise
-        self.ack_watch["accepted" if accepted else "rejected"] += 1
-        return accepted
 
     async def _request_flow(self, request: Request) -> None:
         """
@@ -549,20 +514,17 @@ class RouterLP(BkSysCoLogicalProcess):
         self.ops.fail(f"departure from unknown node {node!r}")
 
     def on_departure(self, request: Optional[Request], visit: Visit, node: str, t: float) -> None:
-        """Service completed at ``node`` (server already freed): route the request onward."""
+        """Service completed at ``node`` (server already freed): wake the request coroutine."""
         if request is None:
             self.ops.fail(f"departure of visit {visit.visit_id} without request", t=t)
         if self._m_visit_departure:
             self._m_visit_departure(request, visit, node, t)
 
-        if self._use_ops:
-            fut = self._completions.pop((visit.request_id, visit.visit_id), None)
-            if fut is None:
-                self.ops.fail(f"departure of visit {visit.visit_id} has no waiting coroutine", t=t)
-            if not fut.done():
-                fut.set_result(t)  # wakes the request coroutine (same simulation timestamp)
-            return
-        self._dispatch(request, self._next_node(request, node), t)
+        fut = self._completions.pop((visit.request_id, visit.visit_id), None)
+        if fut is None:
+            self.ops.fail(f"departure of visit {visit.visit_id} has no waiting coroutine", t=t)
+        if not fut.done():
+            fut.set_result(t)  # wakes the request coroutine (same simulation timestamp)
 
     def on_rejected(self, request: Optional[Request], visit: Visit, node: str, t: float) -> None:
         """
@@ -606,13 +568,12 @@ class RouterLP(BkSysCoLogicalProcess):
         """
         Start one asynchronous transfer of ``request`` to ``node`` at time t.
 
-        Creates a fresh Visit (stations only) and, in Case 2, a fresh operation and (if
-        requested) Future[(request_id, visit_id)] for the service completion of that
-        visit. The ARRIVAL event is scheduled at t + routing_delay with this router as
-        sender.
+        Creates a fresh Visit (stations only), a fresh operation and (if requested)
+        Future[(request_id, visit_id)] for the service completion of that visit. The
+        ARRIVAL event is scheduled at t + routing_delay with this router as sender.
 
         Returns:
-            (operation record or None, visit or None for the Sink, completion Future or None)
+            (operation record, visit or None for the Sink, completion Future or None)
         """
         dest_lp = self.node_lp_ids[node]
         arrival_t = t + self.routing_delay_s
@@ -636,14 +597,8 @@ class RouterLP(BkSysCoLogicalProcess):
                 done = self._event_loop.create_future()
                 self._completions[(visit.request_id, visit.visit_id)] = done
 
-        if self._use_ops:
-            rec = self.ops.create(t, dest_lp, request, visit)  # fails (and cleans) if dest LP is missing
-            payload = self.ops.payload_for(rec, request, visit)
-        else:
-            # Case 1: no operation_id -> the station sends no ACK; a missing destination LP is
-            # then caught by the event loop's own fail-fast delivery check.
-            rec = None
-            payload = OperationPayload(request=request, visit=visit)
+        rec = self.ops.create(t, dest_lp, request, visit)  # fails (and cleans) if dest LP is missing
+        payload = self.ops.payload_for(rec, request, visit)
         self.send_event(Event(
             timestamp=arrival_t,
             sender_id=self.lp_id,
@@ -664,7 +619,6 @@ class RouterLP(BkSysCoLogicalProcess):
             "unfinished": self.n_unfinished,
             "drops_by_node": dict(self.drops_by_node),
             "visits_by_node": dict(self.visits_by_node),
-            "ack_watch": dict(self.ack_watch),
             "flows_started": self.flows_started,
             "flows_finished": self.flows_finished,
             "operations": self.ops.stats() if self.ops else None,
@@ -709,14 +663,12 @@ class NetworkResult:
 class Network:
     """One assembled network = one replication (single use)."""
 
-    def __init__(self, sim: Simulation, end_time: float, router: RouterLP, source: SourceLP,
-                 sink: SinkLP, stations: dict[str, QueueNodeLP], ops: OperationManager):
+    def __init__(self, sim: Simulation, end_time: float, router: RouterLP, sink: SinkLP,
+                 ops: OperationManager):
         self.sim = sim
         self.end_time = end_time
         self.router = router
-        self.source = source
         self.sink = sink
-        self.stations = stations
         self.ops = ops
         self._ran = False
 
@@ -772,7 +724,6 @@ def build_network(
     metrics: Any = None,
     operation_deadline_s: Optional[float] = None,
     routing_delay_s: float = 0.0,
-    use_operations: bool = True,
     record_history: bool = False,
     retain_operation_records: bool = False,
     trace_operations: bool = False,
@@ -793,7 +744,6 @@ def build_network(
         operation_deadline_s: None (baseline: no OP_TIMEOUT events) or a finite
             positive ACK deadline in simulation seconds (timeout test cases only).
         routing_delay_s: transfer delay, 0 in the baseline configuration.
-        use_operations: False builds the Case 1 pure network (no operations/ACK/Future).
         record_history / retain_operation_records / trace_operations: diagnostics.
         force_route / service_time_generators: deterministic hooks for unit tests
             (service generators are keyed by 'Ingress' / 'CPU' / 'Disk').
@@ -824,14 +774,14 @@ def build_network(
     router = RouterLP(
         LP_ROUTER, DEFAULT_NODE_LP_IDS, p, streams.routing,
         routing_delay_s=routing_delay_s, metrics=metrics, force_route=force_route,
-        record_history=record_history, use_operations=use_operations,
+        record_history=record_history,
     )
     ops = OperationManager(
         owner_lp_id=LP_ROUTER,
         schedule_event=lambda e: router.send_event(e),  # dispatcher rebinds send_event at registration
-        future_factory=(lambda: sim.dispatcher.create_future()) if use_operations else None,
-        deadline_s=operation_deadline_s,
+        future_factory=lambda: sim.dispatcher.create_future(),
         lp_exists=lambda lp_id: lp_id in sim.lps,
+        deadline_s=operation_deadline_s,
         retain_records=retain_operation_records,
         trace_enabled=trace_operations,
     )
@@ -859,7 +809,7 @@ def build_network(
     for lp in (router, source, sink, *stations.values()):
         sim.lps[lp.lp_id] = lp
 
-    return Network(sim, end_time, router, source, sink, stations, ops)
+    return Network(sim, end_time, router, sink, ops)
 
 
 __all__ = [

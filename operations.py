@@ -117,9 +117,9 @@ class OperationRecord:
         state: Current OperationState.
         accepted: Admission result carried by the ACK (None until SUCCEEDED).
         future: Future resolved exactly once (result = accepted flag; exceptions for
-            TIMED_OUT / CANCELLED / FAILED). None if no future factory was supplied.
-        finished_at: Simulation time at which the operation finished.
-        reason: Diagnostic text for FAILED / CANCELLED.
+            TIMED_OUT / CANCELLED / FAILED). None only if the operation failed while it
+            was being created (then create() raises and the caller never sees it).
+        reason: Diagnostic text for FAILED / CANCELLED / TIMED_OUT.
     """
     operation_id: str
     request_id: Optional[str]
@@ -131,7 +131,6 @@ class OperationRecord:
     state: OperationState = OperationState.PENDING
     accepted: Optional[bool] = None
     future: Optional[asyncio.Future] = None
-    finished_at: Optional[float] = None
     reason: Optional[str] = None
 
 
@@ -155,15 +154,11 @@ class OperationManager:
             send_event; pass ``lambda e: lp.send_event(e)`` because the dispatcher
             rebinds send_event at registration time).
         future_factory: Callable creating a Future bound to the RUNNING loop
-            (normally ``event_loop.create_future``). If None, no Future is created
-            and wait_ack() is unavailable (useful for synchronous unit tests).
+            (normally ``event_loop.create_future``); one Future per operation.
+        lp_exists: Predicate telling whether a destination LP id is registered. Used
+            to detect a missing destination at send time.
         deadline_s: ACK deadline in simulation seconds. None disables timeouts
             (baseline). When given it must be finite and > 0.
-        lp_exists: Optional predicate telling whether a destination LP id is
-            registered. Used to detect a missing destination at send time.
-        strict_pairing: If True, an ACK must come from the operation's receiver and
-            (when both are present) carry the same visit_id as the operation.
-            A mismatch is a communication failure.
         retain_records: Keep finished records for inspection (tests/diagnostics).
             Off by default to bound memory in long runs.
         trace_enabled: Collect (t, kind, operation_id, detail) trace tuples.
@@ -173,10 +168,9 @@ class OperationManager:
         self,
         owner_lp_id: int,
         schedule_event: Callable[[Event], None],
-        future_factory: Optional[Callable[[], asyncio.Future]] = None,
+        future_factory: Callable[[], asyncio.Future],
+        lp_exists: Callable[[int], bool],
         deadline_s: Optional[float] = None,
-        lp_exists: Optional[Callable[[int], bool]] = None,
-        strict_pairing: bool = True,
         retain_records: bool = False,
         trace_enabled: bool = False,
     ):
@@ -189,7 +183,6 @@ class OperationManager:
         self._future_factory = future_factory
         self.deadline_s = float(deadline_s) if deadline_s is not None else None
         self._lp_exists = lp_exists
-        self._strict_pairing = strict_pairing
 
         self._pending: dict[str, OperationRecord] = {}
         self._issued = 0
@@ -239,9 +232,6 @@ class OperationManager:
     def failure_reason(self) -> Optional[str]:
         """Diagnostic text of the first communication failure, if any."""
         return self._failure_reason
-
-    def is_pending(self, operation_id: str) -> bool:
-        return operation_id in self._pending
 
     def get_record(self, operation_id: str) -> Optional[OperationRecord]:
         """Return a pending record, or a finished one if retain_records=True."""
@@ -305,11 +295,10 @@ class OperationManager:
         self._counters["created"] += 1
         self._trace(t, "create", op_id, f"to LP {receiver_id}")
 
-        if self._lp_exists is not None and not self._lp_exists(receiver_id):
+        if not self._lp_exists(receiver_id):
             self.fail(f"destination LP {receiver_id} does not exist", operation_id=op_id, t=t)
 
-        if self._future_factory is not None:
-            rec.future = self._future_factory()
+        rec.future = self._future_factory()
 
         if deadline_at is not None:
             self._schedule_event(Event(
@@ -343,10 +332,7 @@ class OperationManager:
 
         Raises:
             OperationTimeoutError / OperationCancelledError / OperationFailedError.
-            RuntimeError: if the manager was built without a future_factory.
         """
-        if record.future is None:
-            raise RuntimeError("no Future bound to this operation (future_factory not supplied)")
         return await record.future
 
     # -------------------------------------------------------------------- ACK
@@ -375,16 +361,17 @@ class OperationManager:
         if payload.accepted is None:
             self.fail(f"ACK for {op_id} carries no admission result", operation_id=op_id, t=t)
 
-        if self._strict_pairing:
-            if event.sender_id != rec.receiver_id:
-                self.fail(
-                    f"ACK for {op_id} sent by LP {event.sender_id}, expected LP {rec.receiver_id}",
-                    operation_id=op_id, t=t)
-            if (payload.visit is not None and rec.visit_id is not None
-                    and payload.visit.visit_id != rec.visit_id):
-                self.fail(
-                    f"ACK for {op_id} carries visit {payload.visit.visit_id}, expected {rec.visit_id}",
-                    operation_id=op_id, t=t)
+        # Pairing check: the ACK must come from the receiver of this operation and, when it
+        # carries a visit, from the same visit.
+        if event.sender_id != rec.receiver_id:
+            self.fail(
+                f"ACK for {op_id} sent by LP {event.sender_id}, expected LP {rec.receiver_id}",
+                operation_id=op_id, t=t)
+        if (payload.visit is not None and rec.visit_id is not None
+                and payload.visit.visit_id != rec.visit_id):
+            self.fail(
+                f"ACK for {op_id} carries visit {payload.visit.visit_id}, expected {rec.visit_id}",
+                operation_id=op_id, t=t)
 
         accepted = bool(payload.accepted)
         self._finish(rec, OperationState.SUCCEEDED, t, accepted=accepted)
@@ -392,10 +379,8 @@ class OperationManager:
         return AckStatus.RESOLVED
 
     def _classify_unmatched_ack(self, op_id: str, t: float) -> AckStatus:
-        idx = self._index_of(op_id)
-        if idx is None:
-            self.fail(f"ACK for unknown operation id {op_id!r}", t=t)
-        state = OperationState(self._state_codes[idx - 1])
+        # op_id was validated by _payload_of: it is an id this manager issued earlier
+        state = OperationState(self._state_codes[self._index_of(op_id) - 1])
         if state is OperationState.SUCCEEDED:
             self._counters["duplicate_acks"] += 1
             status = AckStatus.DUPLICATE
@@ -431,8 +416,6 @@ class OperationManager:
 
         rec = self._pending.get(op_id)
         if rec is None:
-            if self._index_of(op_id) is None:
-                self.fail(f"timeout for unknown operation id {op_id!r}", t=t)
             self._counters["timeouts_ignored"] += 1
             self._trace(t, "timeout_ignored", op_id, "already finished")
             return False
@@ -520,13 +503,10 @@ class OperationManager:
         if rec.state is not OperationState.PENDING:
             return  # already finished; never resolve a Future twice
         rec.state = state
-        rec.finished_at = t
         rec.accepted = accepted
         rec.reason = reason
         self._pending.pop(rec.operation_id, None)
-        idx = self._index_of(rec.operation_id)
-        if idx is not None:
-            self._state_codes[idx - 1] = int(state)
+        self._state_codes[self._index_of(rec.operation_id) - 1] = int(state)
         if self._records is not None:
             self._records[rec.operation_id] = rec
 
@@ -570,7 +550,7 @@ class OperationManager:
 
     @staticmethod
     def _index_of(operation_id: Optional[str]) -> Optional[int]:
-        """Parse 'op-N' into N; None if the id is not a valid, already issued id."""
+        """Parse 'op-N' into N; None if the text is not of the form 'op-<positive integer>'."""
         if not isinstance(operation_id, str) or not operation_id.startswith(_OP_PREFIX):
             return None
         digits = operation_id[len(_OP_PREFIX):]
@@ -595,10 +575,10 @@ class OperationManager:
         else:
             self.fail(f"malformed payload type {type(p).__name__} in {event.event_type}",
                       t=event.timestamp)
-        # An id that was never issued (checked only for ids we are about to look up)
-        idx = self._index_of(payload.operation_id) if payload.operation_id is not None else None
-        if payload.operation_id is not None and (idx is None or idx > self._issued):
-            self.fail(f"unknown operation id {payload.operation_id!r}", t=event.timestamp)
+        if payload.operation_id is not None:
+            idx = self._index_of(payload.operation_id)
+            if idx is None or idx > self._issued:  # malformed id, or never issued by this manager
+                self.fail(f"unknown operation id {payload.operation_id!r}", t=event.timestamp)
         return payload
 
     def _trace(self, t: float, kind: str, operation_id: Optional[str], detail: str) -> None:

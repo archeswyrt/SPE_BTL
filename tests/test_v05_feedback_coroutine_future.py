@@ -1,8 +1,8 @@
 # Copyright (C) 2026 SPE Team - Dev 2
 """
-Test N01: Ingress-CPU-Disk network with feedback, Case 2 (coroutine + Future).
+Test N01: Ingress-CPU-Disk network with feedback, coroutine + Future.
 
-Design under test (Case 2): every request runs as one ``async def`` flow. At each
+Design under test: every request runs as one ``async def`` flow. At each
 station visit it awaits the admission ACK, then sleeps on Future[(request_id, visit_id)].
 The station frees its server before calling on_departure, which does ``set_result`` and
 wakes the coroutine, which then loops on to the next station (Disk -> CPU feedback).
@@ -116,7 +116,7 @@ class NetworkMetricCollectorN01:
 
 
 class TestN01FeedbackCoroutineFuture(unittest.TestCase):
-    """Case 2 network: coroutine per request, Future[(req_id, visit_id)], feedback via Disk."""
+    """Network with one coroutine per request, Future[(req_id, visit_id)], feedback via Disk."""
 
     def test_feedback_with_coroutine_future(self):
         collector = NetworkMetricCollectorN01(t0=0.0, t1=10.0)
@@ -138,9 +138,7 @@ class TestN01FeedbackCoroutineFuture(unittest.TestCase):
             metrics=collector,
             service_time_generators={"Ingress": const(1.0), "CPU": const(2.0), "Disk": const(3.0)},
             force_route=lambda req, cpu_visit_index: req.request_id == "R1" and cpu_visit_index == 1,
-            use_operations=True,                 # Case 2: coroutine + Future
             record_history=True,
-            retain_operation_records=True,
         )
         result = net.run()
         collector.close_window()
@@ -218,7 +216,7 @@ class TestN01FeedbackCoroutineFuture(unittest.TestCase):
                 "all (nq=0, ns=0)", all(collector.saved[n] == (0, 0) for n in collector.NODES)),
         ]
         print_table(
-            title="N01-1: Case 2 network (coroutine + Future) event timeline trace, feedback via Disk",
+            title="N01-1: network with coroutine + Future, event timeline trace, feedback via Disk",
             headers=["t (s)", "Event", "Action", "Actual", "Expected", "Match"],
             rows=timeline_rows,
             alignments=["center", "left", "left", "left", "left", "center"],
