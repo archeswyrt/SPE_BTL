@@ -1,6 +1,6 @@
 # Copyright (C) 2026 SPE Team - Dev 2
 """
-Test N02: Ingress-CPU network WITHOUT feedback (p = 0), Case 2 (coroutine + Future).
+Test N02: Ingress-CPU network WITHOUT feedback (p = 0), coroutine + Future.
 
 With p = 0 the CPU never routes to the Disk: every request follows
 Source -> Ingress -> CPU -> Sink. This is the first milestone of the team plan
@@ -46,7 +46,7 @@ from tests.trace_utils import print_table
 
 
 class TestN02NoFeedbackChain(unittest.TestCase):
-    """p = 0: Source -> Ingress -> CPU -> Sink with queueing, coroutine + Future (Case 2)."""
+    """p = 0: Source -> Ingress -> CPU -> Sink with queueing, coroutine + Future."""
 
     def test_chain_without_feedback(self):
         collector = NetworkMetricCollector(t0=0.0, t1=6.0)
@@ -67,9 +67,7 @@ class TestN02NoFeedbackChain(unittest.TestCase):
             streams=streams,
             metrics=collector,
             service_time_generators={"Ingress": const(1.0), "CPU": const(2.0), "Disk": const(3.0)},
-            use_operations=True,                 # Case 2: coroutine + Future
             record_history=True,
-            retain_operation_records=True,
         )
         result = net.run()
         collector.close_window()
